@@ -143,9 +143,9 @@
 #define BLOCK_ROW_TILES (WARP_ROW_TILES * BLOCK_ROW_WARPS)
 #define BLOCK_COL_TILES (WARP_COL_TILES * BLOCK_COL_WARPS)
 
-#define GLOBAL_MEM_STRIDE N_GLOBAL
+#define GLOBAL_MEM_STRIDE N_GLOBAL    // 矩阵C每行在全局内存中的stride，也就是一行的元素数量，16*256
 
-#define SHMEM_STRIDE (N * BLOCK_ROW_TILES)
+#define SHMEM_STRIDE (N * BLOCK_ROW_TILES)    // 矩阵C的共享内存stride=16 * 8=128
 #define SHMEM_OFFSET (N * WARP_ROW_TILES)
 
 // The macro below is used to shift rows of the A matrix and columns of the B matrix
@@ -203,17 +203,25 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
   const unsigned int laneId = threadIdx.x % WARP_SIZE;
 
   // Offset in shared memory from which the B matrix is stored.
+  // 因为在拷贝矩阵A与矩阵B时，共享内存的一半存放A一半存放B。所以要计算一下矩阵B在共享内存中的偏移地址
   const size_t shmem_idx_b_off = BLOCK_COL_TILES * M;
 
   // This pointer is used to access the C and D matrix tiles this warp computes.
+  // warpId/2是因为一个block中的8个warps，需要计算当前warp在block布局中第几行
+  // 从warp为粒度的角度看，block的布局是一行2个warps一列4个warps;
+  // 从fragments粒度的角度看，block中一行的布局是一行有8个fragments一列有2个fragments;
+  // 从elements粒度的角度看，每个fragment中有16x16个元素
+  // 因此，根据warps的布局，warp中一行有8*N=128个元素，一列有M*2(但是此处使用的是K*2,不知为何)。
+  // 因此SHMEM_STRIDE为共享内存中矩阵C的存储stride为16*8;每行的offset为4*N，一个warp中每行有4个fragments
   float *shmem_warp_tile_ptr = (float *)&shmem[0][0] +
-                               (warpId / 2) * SHMEM_STRIDE * K * 2 +
+                               (warpId / 2) * SHMEM_STRIDE * M /* K */ * 2 +
                                (warpId % 2) * SHMEM_OFFSET;
 
   // This pointer is used to stream the C and D matrices block-wide tile to and
   // from shared memory.
+  // 该指针是warp内共享内存的偏移计算，因为warp中每行有4个fragments，因此offset为N*4*2*M
   float *shmem_warp_stream_ptr =
-      (float *)&shmem[0][0] + warpId * SHMEM_STRIDE * K;
+      (float *)&shmem[0][0] + warpId * SHMEM_STRIDE * M /* K */;
 
   // Adjust the beta scaler, as it'll be multiplied by alpha at the end of
   // each tile computation. Technically this is not generally correct (may
@@ -225,8 +233,10 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
   // matrix to the right and down, and selects the next tile to compute. Once
   // there's no such tile, all warps in this CTA exit.
   for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
+    // block_tile_i为tile在纵坐标方向位置
     const unsigned int block_tile_i =
         ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
+    // block_tile_j为tile在横坐标方向的位置， 因为矩阵B是列优先存储
     const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
 
     // Stop when there are no more D matrix tiles to compute in this CTA.
@@ -236,6 +246,7 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
 
     // This warp's pointer to the C matrix data to copy memory from to shared
     // memory.
+    // 为什么block_tile_i要加上warpId
     const size_t gmem_idx =
         (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
     const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
@@ -254,6 +265,7 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
 
     // These fragments will accumulate the result of A and B matrix fragment
     // multiplications along the K_GLOBAL dimension.
+    // 声明一个warp内fragment的数组，每个fragment是一个tile，一个warp中2行4列tiles
     wmma::fragment<wmma::accumulator, M, N, K, float> c[WARP_COL_TILES]
                                                        [WARP_ROW_TILES];
 
