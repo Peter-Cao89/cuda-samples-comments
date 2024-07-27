@@ -100,9 +100,9 @@
 
 // GEMM configuration.
 
-#define M_TILES 256
-#define N_TILES 256
-#define K_TILES 256
+#define M_TILES 256   /* 矩阵A的全局tiles行数 */
+#define N_TILES 256   /* 矩阵B的全局tiles列数 */
+#define K_TILES 256   /* 矩阵A的全局tiles列数，矩阵B的全局tiles行数 */
 
 #define M_GLOBAL (M * M_TILES)
 #define N_GLOBAL (N * N_TILES)
@@ -207,6 +207,7 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
   const size_t shmem_idx_b_off = BLOCK_COL_TILES * M;
 
   // This pointer is used to access the C and D matrix tiles this warp computes.
+  // 因为矩阵C与矩阵D元素类型都是float类型，因此一个block中的矩阵C的tiles占据64KB的共享内存
   // warpId/2是因为一个block中的8个warps，需要计算当前warp在block布局中第几行
   // 从warp为粒度的角度看，block的布局是一行2个warps一列4个warps;
   // 从fragments粒度的角度看，block中一行的布局是一行有8个fragments一列有2个fragments;
@@ -233,10 +234,14 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
   // matrix to the right and down, and selects the next tile to compute. Once
   // there's no such tile, all warps in this CTA exit.
   for (unsigned int block_pos = blockIdx.x;; block_pos += gridDim.x) {
-    // block_tile_i为tile在纵坐标方向位置
-    const unsigned int block_tile_i =
-        ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
-    // block_tile_j为tile在横坐标方向的位置， 因为矩阵B是列优先存储
+    // block_tile_i为tile在纵坐标方向索引，当前线程块负责的tile在全局内存中的行索引
+    // block_pos是当前线程块的索引，BLOCK_ROW_TILES是每个线程块行方向上tiles的数量，N_TILES是矩阵全局tiles的列数
+    // (block_pos * BLOCK_ROW_TILES): 将当前block为索引乘以每个block行方向tiles的数量，得到当前行方向上总tiles数量
+    // ((block_pos * BLOCK_ROW_TILES) / N_TILES): 除以全局矩阵中总的tiles列数，得到当前块在行方向上的block行索引
+    // 得到的block行索引乘以每个block列方向tiles数量，即为当前block中tiles索引的起始点
+    const unsigned int block_tile_i = ((block_pos * BLOCK_ROW_TILES) / N_TILES) * (BLOCK_COL_TILES);
+    // block_tile_j为矩阵B的tiles在横坐标方向的索引，当前线程块负责的tile在全局内存中列索引，
+    // 这块的写法是否有误？理论上应该是(block_pos * BLOCK_ROW_TILES) % N_TILES
     const unsigned int block_tile_j = (block_pos * BLOCK_COL_TILES) % N_TILES;
 
     // Stop when there are no more D matrix tiles to compute in this CTA.
@@ -246,12 +251,20 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
 
     // This warp's pointer to the C matrix data to copy memory from to shared
     // memory.
-    // 为什么block_tile_i要加上warpId
+    // 虽然warp的逻辑布局是2*4个tiles，block的逻辑布局是4*2个warps
+    // 但是按照代码的意思是在执行拷贝操作时一行看做一个warp，也就是8个tiles的一行看作一个warp进行数据加载
+    // 因此，block_tile_i会加上warpId
     const size_t gmem_idx =
         (block_tile_i + warpId) * M * GLOBAL_MEM_STRIDE + block_tile_j * N;
+    // gmem_idx为当前线程要拷贝tile的偏移起始点,将其赋值给src_gmem_warp_stream_ptr*(warp的stream拷贝的全局内存指针地址)
     const float *src_gmem_warp_stream_ptr = &C[gmem_idx];
 
     // Stream multiple C tiles to shared memory.
+    // 将矩阵C的tiles流式的从全局内存拷贝到共享内存中,一个warp拷贝一行tiles(一行有8*16个元素，一共16行)，一共8行tiles
+    // 从全局内存拷贝到共享内存，每个线程只能拷贝一个元素，但是一个warp有16行，因此需要循环16次，每次拷贝一行元素
+    // 一行有16*8=128个float元素，但是一共只有32个线程，因此使用vectorized memory access的方式进行拷贝，拷贝类型设置为int4，这样一次性就可以拷贝完一行
+    // tile内共享内存中一行的stride为16*8+128=SHMEM_STRIDE，全局内存的一行stride为16*256=GLOBAL_MEM_STRIDE
+    // tile内每个线程的索引为laneId
 #pragma unroll
     for (int i = 0; i < K; i++) {
       typedef int4 copy_t;
@@ -260,7 +273,7 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
           *((copy_t *)(src_gmem_warp_stream_ptr + GLOBAL_MEM_STRIDE * i) +
             laneId);
     }
-
+    // 在共享内存进行写完之后执行一个barrier
     __syncthreads();
 
     // These fragments will accumulate the result of A and B matrix fragment
@@ -270,12 +283,13 @@ __global__ void compute_gemm(const half *A, const half *B, const float *C,
                                                        [WARP_ROW_TILES];
 
     // Load the C matrix tiles into fragments from shared memory.
+    // 将每个warp内的矩阵C的tiles从共享内存加载到寄存器中。warp内执行模式的依然是SIMT，因为一个warp内有2行4列
+    // 因此需要将逻辑布局转换为物理布局
 #pragma unroll
-    for (int i = 0; i < WARP_COL_TILES; i++) {
+    for (int i = 0; i < WARP_COL_TILES/* 2 */; i++) {
 #pragma unroll
-      for (int j = 0; j < WARP_ROW_TILES; j++) {
-        const float *tile_ptr =
-            shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
+      for (int j = 0; j < WARP_ROW_TILES/* 4 */; j++) {
+        const float *tile_ptr =  shmem_warp_tile_ptr + i * SHMEM_STRIDE * K + j * N;
 
         wmma::load_matrix_sync(c[i][j], tile_ptr, SHMEM_STRIDE, C_LAYOUT);
       }
